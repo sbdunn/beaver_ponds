@@ -1,0 +1,168 @@
+---
+title: "Precip Data Download"
+author: "Sarah B Dunn"
+date: "3/23/2022"
+output: html_document
+---
+
+```{r download-packages, include=FALSE}
+library(riem) #package for getting weather from ASOS airport weather stations
+library(sf)
+library(mapview)
+library(rayshader) #3D zooming plots
+library(USAboundaries)
+library(raster)
+library(elevatr)
+library(tmap)
+library(tidyverse)
+library(snotelr)
+library(nhdplusTools)
+
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Precipitation Data downloads
+
+First is some general code for downloading airport weather data, followed by code for downloading SNOTEL station data for the Poudre watershed.
+
+## Download and data check for ASOS weather data
+```{r}
+#data acquisition
+
+#view networks available
+network <- riem_networks()
+
+#read Colorado stations, bring in spatial component
+co_stations <- riem_stations(network = 'CO_ASOS')%>%
+  st_as_sf(., coords = c('lon', 'lat'), crs = 4326)
+str(co_stations) # check that it says sf object at top to see that it is spatial
+
+```
+
+
+## Interactive Map
+```{r}
+#view where stations are in interactive map, more useful for initial exploration
+mapview(co_stations)
+
+glimpse(co_stations)
+```
+
+
+## Static Map
+
+### Download DEM data and state boundary data
+```{r}
+co <- us_counties(states = 'Colorado')
+
+co_elev <- elevatr::get_elev_raster(co_stations, z = 9)
+```
+
+### static mapping functions
+```{r}
+tm_shape(co) +
+  tm_polygons(col = 'white')+
+  tm_shape(co_stations) +
+   tm_bubbles(size = 0.2, col = 'blue')
+```
+
+## Download a single site data
+```{r}
+fnl <- riem_measures(station = 'FNL',
+                     date_start = '1985-01-01',
+                     date_end =  '2000-01-01')
+daily <- fnl %>%
+  mutate(date =as.Date(valid)) %>%
+  group_by(date)%>%
+  summarize(daily_temp = mean(tmpf, na.rm = T))
+
+ggplot(daily, aes(x = date, y =daily_temp))+
+  geom_point()+
+  scale_y_log10()
+```
+
+
+## Find precip data for Poudre Watershed
+
+### Download WBD for catchment
+```{r}
+#use the NHD WBD to select sites
+
+#define watershed point
+start_point <- st_sfc(st_point(c(-105.208, 40.660170)), crs = 4326)
+start_comid <- discover_nhdplus_id(start_point)
+
+#get upstream flowlines
+flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = start_comid), 
+                          mode = "upstreamTributaries", 
+                          distance_km = 1000)
+#subset files
+subset_file <- tempfile(fileext = ".gpkg")
+subset <- subset_nhdplus(comids = flowline$UT$nhdplus_comid,
+                         output_file = subset_file,
+                         nhdplus_data = "download", 
+                         flowline_only = FALSE,
+                         return_data = TRUE, overwrite = TRUE)
+#
+flowline <- subset$NHDFlowline_Network
+catchment <- subset$CatchmentSP
+waterbody <- subset$NHDWaterbody
+
+## Or:
+
+flowline <- sf::read_sf(subset_file, "NHDFlowline_Network")
+catchment <- sf::read_sf(subset_file, "CatchmentSP")
+waterbody <- sf::read_sf(subset_file, "NHDWaterbody")
+
+#view
+
+mapview(catchment)
+
+```
+
+
+
+### find snotel sites
+
+```{r}
+# download list of all snotel sites and convert to spatial object
+snotel_sites <- snotel_info()%>%
+    st_as_sf(., coords = c('longitude', 'latitude'), crs = 4269)
+
+# select those that fall within catchment defined above
+poudre_snotel <- st_join(x = snotel_sites, y = catchment, join = st_intersects, left = F)
+
+# view map of snotel sites within the Poudre
+mapview(poudre_snotel)
+```
+
+### Get data from sites
+
+```{r}
+#list sites from above
+snotel_poudre_ID <- poudre_snotel$site_id
+
+#download data as spatial objects
+poudre_precip <- snotel_download(site_id = snotel_poudre_ID, internal = T )%>%
+  st_as_sf(., coords = c('longitude', 'latitude'), crs = 4269)
+
+mapview(poudre_precip)
+```
+
+
+## Data Analysis
+
+This section needs to be moved to the data clean workflow
+
+### subset data to after Cameron Peak Fire
+
+```{r}
+poudre_post_fire_precip <- poudre_precip %>%
+  mutate(obs_date = as.Date(date))%>%
+  filter(obs_date >= "2020-07-01")
+
+ggplot(poudre_post_fire_precip, aes(x = obs_date, y = precipitation))+
+  geom_point(group = 'site_name')
+```
+
